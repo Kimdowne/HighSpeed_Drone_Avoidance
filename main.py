@@ -14,7 +14,7 @@ from planners.vfh_plus import VFHPlusPlanner
 # 3. 장애물 생성 후 선택된 planner(VFH+ 또는 EGO-Planner)가 라이다 점군을 해석한다.
 # 4. 충돌하면 실패, 지정 시간 생존하면 성공으로 기록하고 같은 실험을 반복한다.
 
-PLANNER_TYPE = "ego"  # "ego" 또는 "vfh"
+PLANNER_TYPES = ("ego", "vfh")  # 각 planner를 OBSTACLE_DISTANCES마다 순서대로 실행
 DRONE = "Drone1"  # 조종할 메인 드론 이름
 OBSTACLE = "StaticObstacle"  # 충돌 대상으로 배치할 장애물 차량 이름
 LIDAR = "Lidar2D"  # Drone1에 장착된 라이다 센서 이름
@@ -24,8 +24,8 @@ COMMAND_SPEED = 40.0  # 실제 목표 속도 도달을 위해 넣는 X+ 방향 �
 TARGET_SPEED = 20.0  # 회피 중 유지할 속도이자 장애물을 배치할 실제 전진 속도 기준값
 TARGET_DISTANCE = 500.0  # 시작 위치 기준 전방 목표 지점 거리
 SPAWN_DELAY_SEC = 0.1  # 목표 속도 도달 후 장애물 배치까지 기다릴 시간
-OBSTACLE_DISTANCES = (26.0, )  # 차례로 테스트할 장애물 배치 거리
-TRIALS = 100 # 각 장애물 거리마다 반복할 실험 횟수
+OBSTACLE_DISTANCES = (35.0, 36.0, 36.0, 36.5, 37.0)  # 차례로 테스트할 장애물 배치 거리
+TRIALS = 10 # 각 planner와 장애물 거리 조합마다 반복할 실험 횟수
 SUCCESS_SEC = 10.0  # 장애물 생성 후 이 시간 동안 생존하면 성공
 
 logging.basicConfig(
@@ -35,22 +35,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger("airsim_loop")
 
-if PLANNER_TYPE not in ("ego", "vfh"):
-    raise ValueError(f"Unsupported PLANNER_TYPE: {PLANNER_TYPE}")
+for planner_type in PLANNER_TYPES:
+    if planner_type not in ("ego", "vfh"):
+        raise ValueError(f"Unsupported PLANNER_TYPE: {planner_type}")
 
 client: airsim.MultirotorClient = airsim.MultirotorClient()
 client.confirmConnection()
 
-success_count = 0
-fail_count = 0
-experiment_results = {distance: [] for distance in OBSTACLE_DISTANCES}
+success_count = {planner_type: 0 for planner_type in PLANNER_TYPES}
+fail_count = {planner_type: 0 for planner_type in PLANNER_TYPES}
+experiment_results = {
+    planner_type: {
+        distance_index: {"distance": distance, "results": []}
+        for distance_index, distance in enumerate(OBSTACLE_DISTANCES, start=1)
+    }
+    for planner_type in PLANNER_TYPES
+}
 
-for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
-    distance_success_count = 0
-    distance_fail_count = 0
+for distance_index, OBSTACLE_DISTANCE in enumerate(OBSTACLE_DISTANCES, start=1):
+    logger.info(
+        "starting distance_index=%d distance=%.1fm planners=%s trials_per_planner=%d",
+        distance_index,
+        OBSTACLE_DISTANCE,
+        PLANNER_TYPES,
+        TRIALS,
+    )
+    distance_success_count = {planner_type: 0 for planner_type in PLANNER_TYPES}
+    distance_fail_count = {planner_type: 0 for planner_type in PLANNER_TYPES}
 
-    for trial in range(1, TRIALS + 1):
-        planner = EGOPlanner() if PLANNER_TYPE == "ego" else VFHPlusPlanner()
+    for run_index in range(1, TRIALS * len(PLANNER_TYPES) + 1):
+        planner_type = PLANNER_TYPES[(run_index - 1) // TRIALS]
+        trial = (run_index - 1) % TRIALS + 1
+        planner = EGOPlanner() if planner_type == "ego" else VFHPlusPlanner()
         client.reset()
 
         client.simSetVehiclePose(
@@ -74,6 +90,7 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
         obstacle_placed = False
         last_lidar_seen_at = None
         last_vfh_heading = 0.0
+        last_vfh_command = None
         last_ego_command = None
 
         while True:
@@ -112,19 +129,27 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
             refined = False
             ego_command = None
             ego_planner_invoked = False
+            vfh_command = None
+            vfh_planner_invoked = False
+            command_forward = 0.0
+            command_lateral = 0.0
+            maneuver_mode = "-"
 
-            if PLANNER_TYPE == "vfh":
+            if planner_type == "vfh":
                 if obstacle_placed and point_count > 0:
                     last_lidar_seen_at = now
-                    angle_offset = math.degrees(yaw - target_heading)
                     plan_started = time.perf_counter()
-                    vfh_heading = planner.plan(
+                    vfh_command = planner.plan_command(
                         lidar_data.point_cloud,
-                        angle_offset,
+                        target_heading,
+                        yaw,
                         horizontal_speed,
+                        TARGET_SPEED,
                     )
                     plan_time_ms = (time.perf_counter() - plan_started) * 1000.0
-
+                    last_vfh_command = vfh_command
+                    vfh_planner_invoked = True
+                    vfh_heading = vfh_command.selected_heading
                     if vfh_heading is not None:
                         last_vfh_heading = vfh_heading
                     lidar_active = True
@@ -133,26 +158,39 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
                     obstacle_placed
                     and last_lidar_seen_at is not None
                     and now - last_lidar_seen_at <= 0.5
+                    and last_vfh_command is not None
                 ):
-                    vfh_heading = last_vfh_heading
+                    vfh_command = last_vfh_command
+                    vfh_heading = vfh_command.selected_heading
                     lidar_active = True
                 elif obstacle_placed:
                     planner.prev_heading = 0.0
+                    vfh_command = None
+                else:
+                    vfh_command = None
 
-                if vfh_heading is None:
+                if vfh_command is not None and vfh_command.blocked:
                     vx = 0.0
                     vy = 0.0
                     command_yaw = target_heading
+                    command_forward = 0.0
+                    command_lateral = 0.0
+                    maneuver_mode = vfh_command.maneuver_mode
                     event = "blocked"
-                elif lidar_active:
-                    world_heading = target_heading + math.radians(vfh_heading)
-                    vx = TARGET_SPEED * math.cos(world_heading)
-                    vy = TARGET_SPEED * math.sin(world_heading)
-                    command_yaw = world_heading
+                elif vfh_command is not None and lidar_active:
+                    vx = vfh_command.vx
+                    vy = vfh_command.vy
+                    command_yaw = vfh_command.yaw
+                    command_forward = vfh_command.command_forward
+                    command_lateral = vfh_command.command_lateral
+                    maneuver_mode = vfh_command.maneuver_mode
                 else:
                     vx = COMMAND_SPEED * math.cos(target_heading)
                     vy = COMMAND_SPEED * math.sin(target_heading)
                     command_yaw = target_heading
+                    command_forward = COMMAND_SPEED
+                    command_lateral = 0.0
+                    maneuver_mode = "forward"
 
                 vfh_heading_log = f"{vfh_heading:.1f}" if vfh_heading is not None else "blocked"
                 planner_debug_log = planner.debug_summary() if lidar_active else "-"
@@ -196,21 +234,39 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
                         vx = 0.0
                         vy = 0.0
                         command_yaw = target_heading
+                        command_forward = ego_command.command_forward
+                        command_lateral = ego_command.command_lateral
+                        maneuver_mode = ego_command.maneuver_mode
                         event = "blocked"
                     else:
                         vx = ego_command.vx
                         vy = ego_command.vy
                         command_yaw = ego_command.yaw
+                        command_forward = ego_command.command_forward
+                        command_lateral = ego_command.command_lateral
+                        maneuver_mode = ego_command.maneuver_mode
                 elif last_ego_command is not None:
                     vx = last_ego_command.vx
                     vy = last_ego_command.vy
                     command_yaw = last_ego_command.yaw
+                    command_forward = last_ego_command.command_forward
+                    command_lateral = last_ego_command.command_lateral
+                    maneuver_mode = last_ego_command.maneuver_mode
                 else:
                     vx = COMMAND_SPEED * math.cos(target_heading)
                     vy = COMMAND_SPEED * math.sin(target_heading)
                     command_yaw = target_heading
+                    command_forward = COMMAND_SPEED
+                    command_lateral = 0.0
+                    maneuver_mode = "forward"
 
             command_speed = math.hypot(vx, vy)
+            yaw_error_deg = math.degrees(
+                math.atan2(
+                    math.sin(command_yaw - target_heading),
+                    math.cos(command_yaw - target_heading),
+                )
+            )
 
             client.moveByVelocityZAsync(
                 vx,
@@ -250,18 +306,18 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
             collided = obstacle_placed and collision.has_collided
 
             if collided:
-                fail_count += 1
-                distance_fail_count += 1
-                experiment_results[OBSTACLE_DISTANCE].append(False)
+                fail_count[planner_type] += 1
+                distance_fail_count[planner_type] += 1
+                experiment_results[planner_type][distance_index]["results"].append(False)
                 event = "fail"
 
             if obstacle_placed_at is not None and now - obstacle_placed_at >= SUCCESS_SEC and not collided:
-                success_count += 1
-                distance_success_count += 1
-                experiment_results[OBSTACLE_DISTANCE].append(True)
+                success_count[planner_type] += 1
+                distance_success_count[planner_type] += 1
+                experiment_results[planner_type][distance_index]["results"].append(True)
                 event = "success"
 
-            if PLANNER_TYPE == "ego" and ego_planner_invoked and ego_command is not None:
+            if planner_type == "ego" and ego_planner_invoked and ego_command is not None:
                 timing = ego_command.timing_ms
                 timed_stages = {
                     key: value
@@ -274,7 +330,8 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
                     "EGO_TIMING planner=ego distance=%.1fm trial=%d/%d t=%.2fs lidar_points=%d result=%s reason=%s "
                     "grid_ms=%.3f init_bspline_ms=%.3f anchor_astar_ms=%.3f rebound_optimize_ms=%.3f refine_ms=%.3f "
                     "collision_check_ms=%.3f command_generation_ms=%.3f total_ms=%.3f max_stage=%s max_stage_ms=%.3f "
-                    "astar_segments=%d optimizer_success=%s refined=%s min_clearance=%.3f traj_duration=%.3f command_speed=%.2f",
+                    "astar_segments=%d optimizer_success=%s refined=%s min_clearance=%.3f traj_duration=%.3f "
+                    "command_forward=%.2f command_lateral=%.2f command_speed=%.2f yaw_error_deg=%.2f maneuver_mode=%s",
                     OBSTACLE_DISTANCE,
                     trial,
                     TRIALS,
@@ -297,7 +354,11 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
                     refined,
                     min_clearance,
                     traj_duration,
+                    command_forward,
+                    command_lateral,
                     command_speed,
+                    yaw_error_deg,
+                    maneuver_mode,
                 )
 
                 rebound_timing = ego_command.rebound_timing_ms
@@ -349,40 +410,70 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
                         rebound_stats.get("success", False),
                     )
 
-            # 기존 per-tick 상태 로그는 단계별 연산시간 분석을 위해 비활성화한다.
-            # logger.info(
-            #     "planner=%s distance=%.1fm trial=%d/%d t=%.2fs target_dist=%.1fm speed=%.2fm/s target_forward=%.2fm/s target_hold=%.2fs alt=%.2fm z=%.2f yaw=%.1f target_yaw=%.1f vfh_heading=%s lidar_points=%d plan_time_ms=%.3f min_clearance=%.3f traj_duration=%.3f astar_segments=%d optimizer_success=%s refined=%s command_speed=%.2f planner_debug=%s obstacle=%s collision=%s result=%s distance_success=%d distance_fail=%d total_success=%d total_fail=%d",
-            #     PLANNER_TYPE,
-            #     OBSTACLE_DISTANCE,
-            #     trial,
-            #     TRIALS,
-            #     elapsed,
-            #     target_distance,
-            #     speed,
-            #     target_forward_speed,
-            #     speed_hold,
-            #     altitude,
-            #     position.z_val,
-            #     math.degrees(yaw),
-            #     math.degrees(target_heading),
-            #     vfh_heading_log,
-            #     point_count,
-            #     plan_time_ms,
-            #     min_clearance,
-            #     traj_duration,
-            #     astar_segments,
-            #     optimizer_success,
-            #     refined,
-            #     command_speed,
-            #     planner_debug_log,
-            #     obstacle_placed,
-            #     collision.object_name if collided else False,
-            #     event,
-            #     distance_success_count,
-            #     distance_fail_count,
-            #     success_count,
-            #     fail_count,
-            # )
+            if planner_type == "vfh" and vfh_planner_invoked and vfh_command is not None:
+                logger.info(
+                    "VFH_TIMING planner=vfh distance=%.1fm trial=%d/%d t=%.2fs lidar_points=%d result=%s reason=%s "
+                    "plan_time_ms=%.3f selected_heading=%s command_forward=%.2f command_lateral=%.2f "
+                    "command_speed=%.2f yaw_error_deg=%.2f maneuver_mode=%s blocked=%s",
+                    OBSTACLE_DISTANCE,
+                    trial,
+                    TRIALS,
+                    elapsed,
+                    point_count,
+                    event,
+                    vfh_command.reason,
+                    plan_time_ms,
+                    "-" if vfh_command.selected_heading is None else f"{vfh_command.selected_heading:.2f}",
+                    command_forward,
+                    command_lateral,
+                    command_speed,
+                    yaw_error_deg,
+                    maneuver_mode,
+                    vfh_command.blocked,
+                )
+
+            logger.info(
+                "planner=%s distance=%.1fm trial=%d/%d t=%.2fs target_dist=%.1fm speed=%.2fm/s "
+                "target_forward=%.2fm/s target_hold=%.2fs alt=%.2fm z=%.2f yaw=%.1f target_yaw=%.1f "
+                "yaw_error=%.1f vfh_heading=%s lidar_points=%d plan_time_ms=%.3f min_clearance=%.3f "
+                "traj_duration=%.3f astar_segments=%d optimizer_success=%s refined=%s command_forward=%.2f "
+                "command_lateral=%.2f command_speed=%.2f maneuver_mode=%s planner_debug=%s obstacle=%s "
+                "collision=%s result=%s distance_success=%d distance_fail=%d total_success=%d total_fail=%d",
+                planner_type,
+                OBSTACLE_DISTANCE,
+                trial,
+                TRIALS,
+                elapsed,
+                target_distance,
+                speed,
+                target_forward_speed,
+                speed_hold,
+                altitude,
+                position.z_val,
+                math.degrees(yaw),
+                math.degrees(target_heading),
+                yaw_error_deg,
+                vfh_heading_log,
+                point_count,
+                plan_time_ms,
+                min_clearance,
+                traj_duration,
+                astar_segments,
+                optimizer_success,
+                refined,
+                command_forward,
+                command_lateral,
+                command_speed,
+                maneuver_mode,
+                planner_debug_log,
+                obstacle_placed,
+                collision.object_name if collided else False,
+                event,
+                distance_success_count[planner_type],
+                distance_fail_count[planner_type],
+                success_count[planner_type],
+                fail_count[planner_type],
+            )
 
             if event in ("success", "fail"):
                 client.cancelLastTask(vehicle_name=DRONE)
@@ -390,20 +481,24 @@ for OBSTACLE_DISTANCE in OBSTACLE_DISTANCES:
 
             time.sleep(0.05)
 
-    logger.info(
-        "distance %.1fm complete: success=%d fail=%d trials=%d",
-        OBSTACLE_DISTANCE,
-        distance_success_count,
-        distance_fail_count,
-        TRIALS,
-    )
+    for planner_type in PLANNER_TYPES:
+        logger.info(
+            "planner=%s distance_index=%d distance %.1fm complete: success=%d fail=%d trials=%d",
+            planner_type,
+            distance_index,
+            OBSTACLE_DISTANCE,
+            distance_success_count[planner_type],
+            distance_fail_count[planner_type],
+            TRIALS,
+        )
 
-logger.info(
-    "%s experiment complete: success=%d fail=%d trials=%d distances=%s",
-    PLANNER_TYPE,
-    success_count,
-    fail_count,
-    TRIALS * len(OBSTACLE_DISTANCES),
-    OBSTACLE_DISTANCES,
-)
+for planner_type in PLANNER_TYPES:
+    logger.info(
+        "%s experiment complete: success=%d fail=%d trials=%d distances=%s",
+        planner_type,
+        success_count[planner_type],
+        fail_count[planner_type],
+        TRIALS * len(OBSTACLE_DISTANCES),
+        OBSTACLE_DISTANCES,
+    )
 logger.info("EXPERIMENT_RESULTS = %s", experiment_results)

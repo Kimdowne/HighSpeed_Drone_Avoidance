@@ -1,4 +1,21 @@
 import math
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class VFHPlanCommand:
+    vx: float
+    vy: float
+    yaw: float
+    selected_heading: Optional[float]
+    lateral_speed: float
+    command_forward: float
+    command_lateral: float
+    command_speed: float
+    blocked: bool
+    reason: str
+    maneuver_mode: str
 
 
 class VFHPlusPlanner:
@@ -27,6 +44,11 @@ class VFHPlusPlanner:
         self.max_lateral_accel_mps2 = 30.0
         self.min_turn_radius_m = 0.5
         self.trajectory_sample_step_m = 0.5
+        self.max_lateral_speed_mps = 20.0
+        self.min_lateral_speed_mps = 8.0
+        self.lateral_gain = 1.4
+        self.emergency_lateral_angle_deg = 90.0
+        self.emergency_lateral_check_m = 8.0
 
         self.prev_binary_histogram = [0] * self.num_sectors
         self.prev_heading = 0.0
@@ -98,6 +120,101 @@ class VFHPlusPlanner:
             selected_heading,
         )
         return selected_heading
+
+    def plan_command(self, point_cloud, target_heading=0.0, yaw=0.0, speed=0.0, target_speed=20.0):
+        angle_offset = math.degrees(yaw - target_heading)
+        selected_heading = self.plan(point_cloud, angle_offset, speed)
+        forward_speed = float(target_speed)
+
+        if selected_heading is None:
+            selected_heading = self.emergency_lateral_heading(point_cloud, angle_offset)
+            if selected_heading is None:
+                return VFHPlanCommand(
+                    vx=0.0,
+                    vy=0.0,
+                    yaw=target_heading,
+                    selected_heading=None,
+                    lateral_speed=0.0,
+                    command_forward=0.0,
+                    command_lateral=0.0,
+                    command_speed=0.0,
+                    blocked=True,
+                    reason="blocked",
+                    maneuver_mode="blocked",
+                )
+            reason = "emergency_lateral"
+        else:
+            reason = "ok"
+
+        lateral_speed = self.lateral_speed_from_heading(selected_heading)
+        vx, vy = self.world_velocity(target_heading, forward_speed, lateral_speed)
+        command_speed = math.hypot(vx, vy)
+        maneuver_mode = "forward_lateral" if abs(lateral_speed) > 1e-6 else "forward"
+        return VFHPlanCommand(
+            vx=vx,
+            vy=vy,
+            yaw=target_heading,
+            selected_heading=selected_heading,
+            lateral_speed=lateral_speed,
+            command_forward=forward_speed,
+            command_lateral=lateral_speed,
+            command_speed=command_speed,
+            blocked=False,
+            reason=reason,
+            maneuver_mode=maneuver_mode,
+        )
+
+    def lateral_speed_from_heading(self, selected_heading):
+        heading = self.normalize(selected_heading)
+        if abs(heading) <= self.sector_size / 2.0:
+            return 0.0
+        raw = self.lateral_gain * math.tan(math.radians(heading)) * self.min_lateral_speed_mps
+        if abs(raw) <= 1e-6:
+            return 0.0
+        sign = 1.0 if raw > 0.0 else -1.0
+        magnitude = min(abs(raw), self.max_lateral_speed_mps)
+        magnitude = max(magnitude, self.min_lateral_speed_mps)
+        return sign * magnitude
+
+    def world_velocity(self, target_heading, forward_speed, lateral_speed):
+        forward_x = math.cos(target_heading)
+        forward_y = math.sin(target_heading)
+        lateral_x = -math.sin(target_heading)
+        lateral_y = math.cos(target_heading)
+        return (
+            forward_speed * forward_x + lateral_speed * lateral_x,
+            forward_speed * forward_y + lateral_speed * lateral_y,
+        )
+
+    def emergency_lateral_heading(self, point_cloud, angle_offset):
+        active_cells, grid_lookup, _, valid_points = self.build_active_grid(point_cloud, angle_offset)
+        if valid_points == 0:
+            return 0.0
+
+        left_clear = self.straight_segment_is_clear(
+            0.0,
+            0.0,
+            math.radians(self.emergency_lateral_angle_deg),
+            self.emergency_lateral_check_m,
+            grid_lookup,
+        )
+        right_clear = self.straight_segment_is_clear(
+            0.0,
+            0.0,
+            math.radians(-self.emergency_lateral_angle_deg),
+            self.emergency_lateral_check_m,
+            grid_lookup,
+        )
+        if not left_clear and not right_clear:
+            return None
+        if left_clear and not right_clear:
+            return self.emergency_lateral_angle_deg
+        if right_clear and not left_clear:
+            return -self.emergency_lateral_angle_deg
+
+        left_density = sum(cell["certainty"] for cell in active_cells if cell["y"] > 0.0)
+        right_density = sum(cell["certainty"] for cell in active_cells if cell["y"] < 0.0)
+        return self.emergency_lateral_angle_deg if left_density <= right_density else -self.emergency_lateral_angle_deg
 
     def build_active_grid(self, point_cloud, angle_offset):
         cell_sums = {}

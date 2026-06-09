@@ -4,6 +4,7 @@ import unittest
 import numpy as np
 
 from planners.ego_planner import EGOPlanner
+from planners.vfh_plus import VFHPlusPlanner
 
 
 TIMING_KEYS = {
@@ -130,6 +131,10 @@ class EGOPlannerTest(unittest.TestCase):
         self.assertFalse(command.blocked)
         self.assertAlmostEqual(command.vx, 20.0, places=6)
         self.assertAlmostEqual(command.vy, 0.0, places=6)
+        self.assertAlmostEqual(command.yaw, 0.0, places=6)
+        self.assertAlmostEqual(command.command_forward, 20.0, places=6)
+        self.assertAlmostEqual(command.command_lateral, 0.0, places=6)
+        self.assertEqual(command.maneuver_mode, "forward")
         self.assertTrue(command.optimizer_success)
         self.assertEqual(set(command.timing_ms), TIMING_KEYS)
         self.assertGreaterEqual(command.timing_ms["grid"], 0.0)
@@ -160,7 +165,10 @@ class EGOPlannerTest(unittest.TestCase):
         self.assertFalse(command.blocked)
         self.assertGreater(command.astar_segments, 0)
         self.assertTrue(command.optimizer_success)
-        self.assertGreater(abs(command.vy), 0.1)
+        self.assertAlmostEqual(command.command_forward, 20.0, places=6)
+        self.assertGreaterEqual(abs(command.command_lateral), 8.0)
+        self.assertAlmostEqual(command.yaw, 0.0, places=6)
+        self.assertEqual(command.maneuver_mode, "forward_lateral")
         self.assertEqual(set(command.timing_ms), TIMING_KEYS)
         self.assertGreater(command.timing_ms["anchor_astar"], 0.0)
         self.assertGreater(command.timing_ms["rebound_optimize"], 0.0)
@@ -170,6 +178,32 @@ class EGOPlannerTest(unittest.TestCase):
         self.assertGreater(command.rebound_timing_ms["objective_total"], 0.0)
         self.assertGreater(command.rebound_stats["attempts"], 0)
         self.assertGreater(command.rebound_stats["objective_calls"], 0)
+
+    def test_center_obstacle_lateral_command_rotates_with_target_heading(self):
+        planner = EGOPlanner()
+        cloud = []
+        for x in (19.5, 20.0, 20.5):
+            for y in (-0.5, 0.0, 0.5):
+                cloud.extend([x, y, 0.0])
+
+        command = planner.plan(
+            point_cloud=cloud,
+            position=(0.0, 0.0),
+            velocity=(0.0, 20.0),
+            yaw=math.pi / 2.0,
+            target_position=(0.0, 100.0),
+            target_speed=20.0,
+        )
+
+        forward_axis = np.array([0.0, 1.0])
+        lateral_axis = np.array([-1.0, 0.0])
+        velocity = np.array([command.vx, command.vy])
+
+        self.assertFalse(command.blocked)
+        self.assertAlmostEqual(float(np.dot(velocity, forward_axis)), 20.0, places=6)
+        self.assertAlmostEqual(float(np.dot(velocity, lateral_axis)), command.command_lateral, places=6)
+        self.assertGreaterEqual(abs(command.command_lateral), 8.0)
+        self.assertAlmostEqual(command.yaw, math.pi / 2.0, places=6)
 
     def test_rebound_anchor_uses_obstacle_surface_base_point(self):
         planner = EGOPlanner()
@@ -230,10 +264,73 @@ class EGOPlannerTest(unittest.TestCase):
         self.assertTrue(command.blocked)
         self.assertAlmostEqual(command.vx, 0.0, places=6)
         self.assertAlmostEqual(command.vy, 0.0, places=6)
+        self.assertAlmostEqual(command.command_forward, 0.0, places=6)
+        self.assertAlmostEqual(command.command_lateral, 0.0, places=6)
+        self.assertEqual(command.maneuver_mode, "blocked")
         self.assertFalse(command.optimizer_success)
         self.assertEqual(set(command.timing_ms), TIMING_KEYS)
         self.assertEqual(set(command.rebound_timing_ms), REBOUND_TIMING_KEYS)
         self.assertAlmostEqual(command.timing_ms["total"], command.plan_time_ms)
+
+
+class VFHPlusPlannerTest(unittest.TestCase):
+    def test_vfh_no_obstacle_goes_forward_without_yaw_turn(self):
+        planner = VFHPlusPlanner()
+
+        command = planner.plan_command(
+            point_cloud=[],
+            target_heading=math.pi / 6.0,
+            yaw=math.pi / 6.0,
+            speed=20.0,
+            target_speed=20.0,
+        )
+
+        self.assertFalse(command.blocked)
+        self.assertAlmostEqual(command.command_forward, 20.0, places=6)
+        self.assertAlmostEqual(command.command_lateral, 0.0, places=6)
+        self.assertAlmostEqual(command.yaw, math.pi / 6.0, places=6)
+        self.assertEqual(command.maneuver_mode, "forward")
+
+    def test_vfh_center_obstacle_uses_lateral_speed(self):
+        planner = VFHPlusPlanner()
+        cloud = []
+        for x in (19.5, 20.0, 20.5):
+            for y in (-0.5, 0.0, 0.5):
+                cloud.extend([x, y, 0.0])
+
+        command = planner.plan_command(
+            point_cloud=cloud,
+            target_heading=0.0,
+            yaw=0.0,
+            speed=20.0,
+            target_speed=20.0,
+        )
+
+        self.assertFalse(command.blocked)
+        self.assertAlmostEqual(command.command_forward, 20.0, places=6)
+        self.assertGreaterEqual(abs(command.command_lateral), 8.0)
+        self.assertAlmostEqual(command.yaw, 0.0, places=6)
+        self.assertEqual(command.maneuver_mode, "forward_lateral")
+
+    def test_vfh_surrounded_blocks_when_no_lateral_escape_exists(self):
+        planner = VFHPlusPlanner()
+        cloud = []
+        for index in range(36):
+            angle = 2.0 * math.pi * index / 36.0
+            cloud.extend([2.0 * math.cos(angle), 2.0 * math.sin(angle), 0.0])
+
+        command = planner.plan_command(
+            point_cloud=cloud,
+            target_heading=0.0,
+            yaw=0.0,
+            speed=20.0,
+            target_speed=20.0,
+        )
+
+        self.assertTrue(command.blocked)
+        self.assertAlmostEqual(command.vx, 0.0, places=6)
+        self.assertAlmostEqual(command.vy, 0.0, places=6)
+        self.assertEqual(command.maneuver_mode, "blocked")
 
 
 if __name__ == "__main__":

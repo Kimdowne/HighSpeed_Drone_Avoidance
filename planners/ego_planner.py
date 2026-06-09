@@ -51,6 +51,9 @@ class EGOPlannerConfig:
     min_horizon_m: float = 8.0
     control_point_distance_m: float = 2.0
     command_lookahead_s: float = 0.8
+    max_lateral_speed_mps: float = 20.0
+    min_lateral_speed_mps: float = 8.0
+    lateral_gain: float = 1.4
     lambda_smooth: float = 1.0
     lambda_collision: float = 0.5
     lambda_feasibility: float = 0.1
@@ -75,6 +78,9 @@ class EGOPlanCommand:
     optimizer_success: bool
     command_speed: float
     refined: bool
+    command_forward: float = 0.0
+    command_lateral: float = 0.0
+    maneuver_mode: str = "unknown"
     timing_ms: dict = field(default_factory=dict)
     rebound_timing_ms: dict = field(default_factory=dict)
     rebound_stats: dict = field(default_factory=dict)
@@ -407,10 +413,13 @@ class EGOPlanner:
         stage_started = time.perf_counter()
         lookahead = min(max(dt, self.config.command_lookahead_s), max(dt, trajectory.duration))
         lookahead_point = trajectory.evaluate(lookahead)
-        command_direction = lookahead_point - start
-        if np.linalg.norm(command_direction) < 1e-6:
-            command_direction = local_target - start
-        vx, vy, command_yaw = self._velocity_from_direction(command_direction, command_speed, target_heading)
+        vx, vy, command_yaw, command_forward, command_lateral, maneuver_mode = self._forward_lateral_command(
+            start,
+            lookahead_point,
+            target_heading,
+            command_speed,
+            lookahead,
+        )
         self._record_timing(timing_ms, "command_generation", stage_started)
 
         self._last_control_points = control_points
@@ -426,6 +435,9 @@ class EGOPlanner:
             "traj_duration": round(trajectory.duration, 3),
             "dt": round(dt, 3),
             "command": (round(float(vx), 3), round(float(vy), 3)),
+            "command_forward": round(command_forward, 3),
+            "command_lateral": round(command_lateral, 3),
+            "maneuver_mode": maneuver_mode,
             "timing_ms": self._rounded_timing(timing_ms),
             "rebound_timing_ms": self._rounded_rebound_timing(rebound_timing_ms),
             "rebound_stats": dict(rebound_stats),
@@ -443,6 +455,9 @@ class EGOPlanner:
             optimizer_success=optimizer_success,
             command_speed=math.hypot(vx, vy),
             refined=refined,
+            command_forward=command_forward,
+            command_lateral=command_lateral,
+            maneuver_mode=maneuver_mode,
             timing_ms=timing_ms,
             rebound_timing_ms=rebound_timing_ms,
             rebound_stats=rebound_stats,
@@ -1163,6 +1178,36 @@ class EGOPlanner:
         unit = direction / norm
         return speed * unit[0], speed * unit[1], math.atan2(unit[1], unit[0])
 
+    def _frame_axes(self, heading):
+        forward_axis = np.array([math.cos(heading), math.sin(heading)], dtype=float)
+        lateral_axis = np.array([-math.sin(heading), math.cos(heading)], dtype=float)
+        return forward_axis, lateral_axis
+
+    def _forward_lateral_command(self, start, lookahead_point, target_heading, forward_speed, lookahead_time):
+        forward_axis, lateral_axis = self._frame_axes(target_heading)
+        offset = lookahead_point - start
+        lateral_offset = float(np.dot(offset, lateral_axis))
+        lateral_speed = self.config.lateral_gain * lateral_offset / max(float(lookahead_time), 1e-3)
+        lateral_speed = self._clamp_lateral_speed(lateral_speed)
+        velocity = forward_axis * forward_speed + lateral_axis * lateral_speed
+        maneuver_mode = "forward_lateral" if abs(lateral_speed) > 1e-6 else "forward"
+        return (
+            float(velocity[0]),
+            float(velocity[1]),
+            target_heading,
+            float(forward_speed),
+            float(lateral_speed),
+            maneuver_mode,
+        )
+
+    def _clamp_lateral_speed(self, lateral_speed):
+        if abs(lateral_speed) <= 1e-6:
+            return 0.0
+        sign = 1.0 if lateral_speed > 0.0 else -1.0
+        magnitude = min(abs(lateral_speed), self.config.max_lateral_speed_mps)
+        magnitude = max(magnitude, self.config.min_lateral_speed_mps)
+        return sign * magnitude
+
     def _straight_command(
         self,
         started_at,
@@ -1177,6 +1222,9 @@ class EGOPlanner:
         stage_started = time.perf_counter()
         vx = command_speed * math.cos(heading)
         vy = command_speed * math.sin(heading)
+        command_forward = command_speed
+        command_lateral = 0.0
+        maneuver_mode = "forward"
         if timing_ms is not None:
             self._record_timing(timing_ms, "command_generation", stage_started)
 
@@ -1187,6 +1235,9 @@ class EGOPlanner:
             "optimizer_success": True,
             "refined": False,
             "command": (round(float(vx), 3), round(float(vy), 3)),
+            "command_forward": round(command_forward, 3),
+            "command_lateral": round(command_lateral, 3),
+            "maneuver_mode": maneuver_mode,
         }
         command = self._finish_command(
             started_at,
@@ -1200,6 +1251,9 @@ class EGOPlanner:
             optimizer_success=True,
             command_speed=command_speed,
             refined=False,
+            command_forward=command_forward,
+            command_lateral=command_lateral,
+            maneuver_mode=maneuver_mode,
             reason=reason,
             timing_ms=timing_ms,
             rebound_timing_ms=rebound_timing_ms,
@@ -1230,6 +1284,9 @@ class EGOPlanner:
             "astar_segments": astar_segments,
             "optimizer_success": False,
             "refined": False,
+            "command_forward": 0.0,
+            "command_lateral": 0.0,
+            "maneuver_mode": "blocked",
         }
         command = self._finish_command(
             started_at,
@@ -1243,6 +1300,9 @@ class EGOPlanner:
             optimizer_success=False,
             command_speed=0.0,
             refined=False,
+            command_forward=0.0,
+            command_lateral=0.0,
+            maneuver_mode="blocked",
             reason=reason,
             timing_ms=timing_ms,
             rebound_timing_ms=rebound_timing_ms,
@@ -1266,6 +1326,9 @@ class EGOPlanner:
         optimizer_success,
         command_speed,
         refined,
+        command_forward=0.0,
+        command_lateral=0.0,
+        maneuver_mode="unknown",
         reason="ok",
         timing_ms=None,
         rebound_timing_ms=None,
@@ -1299,6 +1362,9 @@ class EGOPlanner:
             optimizer_success=bool(optimizer_success),
             command_speed=float(command_speed),
             refined=bool(refined),
+            command_forward=float(command_forward),
+            command_lateral=float(command_lateral),
+            maneuver_mode=maneuver_mode,
             timing_ms=timing_ms,
             rebound_timing_ms=rebound_timing_ms,
             rebound_stats=rebound_stats,
